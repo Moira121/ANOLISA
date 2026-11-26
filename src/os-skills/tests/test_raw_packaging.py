@@ -86,6 +86,100 @@ class RawPackagingTests(unittest.TestCase):
                 self.assertEqual(sbom["metadata"]["component"]["hashes"][0]["content"], digest)
                 self.assertEqual(sbom["metadata"]["component"]["properties"][2]["value"], arch)
 
+    # Windows packagers currently emit backslash member names (#10397); the
+    # POSIX member paths asserted here are produced by the Linux CI builders.
+    @unittest.skipIf(os.name == "nt", "raw archive member paths are POSIX on Linux builders")
+    def test_fixture_payload_and_sbom_fidelity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "component.toml").write_text(
+                (ROOT / "component.toml").read_text(encoding="utf-8"), encoding="utf-8"
+            )
+            (root / "packaging").mkdir()
+            (root / "packaging/released-skills.txt").write_text("ai/example\n", encoding="utf-8")
+            skill = root / "ai/example"
+            (skill / "nested/tools").mkdir(parents=True)
+            fixture = {
+                "share/anolisa/skills/example/SKILL.md":
+                    b"# Example Skill\n\nfixed fixture payload\n",
+                "share/anolisa/skills/example/nested/tools/helper.py":
+                    bytes(range(256)) * 64,
+                "share/anolisa/skills/example/nested/data.bin":
+                    bytes(range(255, -1, -1)) * 33,
+            }
+            for destination, data in fixture.items():
+                path = root / "ai/example" / destination.removeprefix(
+                    "share/anolisa/skills/example/"
+                )
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+            with (root / "component.toml").open("a") as manifest:
+                manifest.write('\n[[adapters.hermes.skills]]\nname = "example"\n'
+                               'source = "{datadir}/skills/example/"\n')
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "add", "component.toml", "packaging", "ai"], check=True
+            )
+            version = tomllib.loads((root / "component.toml").read_text())["component"]["version"]
+            output = root / "artifacts"
+            for arch in ("x86_64", "aarch64"):
+                result = self.build(root, output, arch)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                archive = output / f"os-skills-{version}-linux-{arch}.tar.gz"
+                with tarfile.open(archive) as package:
+                    member_names = [
+                        m.name.removeprefix("./") for m in package.getmembers() if m.isfile()
+                    ]
+                    for name in [*fixture, ".anolisa/component.toml"]:
+                        self.assertEqual(member_names.count(name), 1, name)
+                    self.assertEqual(
+                        set(member_names), set(fixture) | {".anolisa/component.toml"}
+                    )
+                    files = {
+                        m.name.removeprefix("./"): m
+                        for m in package.getmembers() if m.isfile()
+                    }
+                    archived = {
+                        name: package.extractfile(member).read()
+                        for name, member in files.items()
+                    }
+                    for name, data in fixture.items():
+                        self.assertEqual(archived[name], data, name)
+                    contract = tomllib.loads(
+                        archived[".anolisa/component.toml"].decode()
+                    )
+                    self.assertEqual(contract["component"]["name"], "os-skills")
+                    self.assertEqual(contract["component"]["version"], version)
+                    self.assertEqual(contract["component"]["platform"]["os"], ["linux"])
+                    self.assertEqual(
+                        contract["component"]["platform"]["arch"], ["x86_64", "aarch64"]
+                    )
+                    self.assertEqual(contract["install"]["modes"], ["user", "system"])
+                    destinations = {
+                        entry["source"]: entry.get("target")
+                        for entry in contract["component"]["layout"]["files"]
+                    }
+                    self.assertEqual(
+                        destinations[".anolisa/component.toml"],
+                        "{datadir}/components/os-skills/component.toml",
+                    )
+                    self.assertEqual(destinations["share/anolisa/skills/"], "{datadir}/skills")
+                sbom = json.loads((output / f"{archive.name}.cdx.json").read_text())
+                records = [c for c in sbom["components"] if c["type"] == "file"]
+                record_names = [c["name"] for c in records]
+                self.assertEqual(len(record_names), len(set(record_names)))
+                self.assertEqual(set(record_names), set(files))
+                references = [c["bom-ref"] for c in records]
+                self.assertEqual(len(references), len(set(references)))
+                for component in records:
+                    self.assertEqual(component["hashes"][0]["alg"], "SHA-256")
+                    self.assertEqual(
+                        component["hashes"][0]["content"],
+                        hashlib.sha256(archived[component["name"]]).hexdigest(),
+                        component["name"],
+                    )
+                self.assertEqual(sbom["metadata"]["component"]["properties"][2]["value"], arch)
+
     def test_rejects_wrong_version_and_ignores_untracked_files(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
